@@ -10,42 +10,88 @@ import scala.concurrent.duration._
 import scala.reflect.ClassTag
 import scala.util.{Failure, Success}
 
+case class Config( minVotes: Int = 50,
+                   topTitles: Int = 20,
+                   sparkMaster: String = "local[*]",
+                   timeout: Duration = 1 hour,
+                   titleRatingsFile: String = "title.ratings.tsv.gz",
+                   titleAkasFile: String = "title.akas.tsv.gz",
+                   titlePrincipalsFile: String = "title.principals.tsv.gz",
+                   nameBasicsFile: String = "name.basics.tsv.gz",
+                   )
 object App {
+  private val parser = new scopt.OptionParser[Config]("imdb") {
+    head("imdb", "1.x")
 
+    opt[Int]('m', "minVotes") action { (x, c) =>
+      c.copy(minVotes = x) } text("Minimum number of votes for a title (default: 50)")
+
+    opt[Int]('t', "topTitles") action { (x, c) =>
+      c.copy(topTitles = x) } text("Number of top titles to selec (default: 20)")
+
+    opt[String]("sparkMaster") action { (x, c) =>
+      c.copy(sparkMaster = x) } text("Spark Master host (default: local[*])")
+
+    opt[String]("timeout") action { (x, c) =>
+      c.copy(timeout = Duration.apply(x)) } text("Spark job timeout (default 1 hour)")
+
+    opt[String]("titleRatingsFile") required() valueName("<file>") action { (x, c) =>
+      c.copy(titleRatingsFile = x) } text("File containing the ratings information for titles (title.ratings.tsv.gz)")
+
+    opt[String]("titleAkasFile") required() valueName("<file>") action { (x, c) =>
+      c.copy(titleAkasFile = x) } text("File containing the title names (title.akas.tsv.gz)")
+
+    opt[String]("titlePrincipalsFile") required() valueName("<file>") action { (x, c) =>
+      c.copy(titlePrincipalsFile = x) } text("File containing title principals (title.principals.tsv.gz)")
+
+    opt[String]("nameBasicsFile") required() valueName("<file>") action { (x, c) =>
+      c.copy(nameBasicsFile = x) } text("File containing information for names (name.basics.tsv.gz )")
+
+  }
 
   def main(args : Array[String]) {
+    parser.parse(args, Config()) map { config =>
+      doRun(config)
+    } getOrElse {
+      println("Invalid command line arguments")
+    }
+  }
 
-    val conf = new SparkConf().setAppName("IMDB Ratings").setMaster("local[*]")
+  private def doRun(config:Config) = {
+    val conf = new SparkConf().setAppName("IMDB Ratings").setMaster(config.sparkMaster)
     val sc = new SparkContext(conf)
 
     // load title ratings and retain only those with rating >=50
-    val ratings = readDataFile(sc, mapToTitleRating, "C:\\dev\\imdb\\title.ratings.tsv.gz")
-                       .filter(_.numVotes >= 50)
+    val ratings = readDataFile(sc, mapToTitleRating, config.titleRatingsFile)
+      .filter(_.numVotes >= config.minVotes)
     // cache ratings because we will iterate it more than once
     ratings.cache()
 
     // load title and persons data
-    val titleAkas = readDataFile(sc, mapToTitleAka, "C:\\dev\\imdb\\title.akas.tsv.gz")
-    val titlePrincipals = readDataFile(sc, mapToTitlePrincipal, "C:\\dev\\imdb\\title.principals.tsv.gz")
-    val persons = readDataFile(sc, mapToPerson, "C:\\dev\\imdb\\name.basics.tsv.gz")
+    val titleAkas = readDataFile(sc, mapToTitleAka, config.titleAkasFile)
+    val titlePrincipals = readDataFile(sc, mapToTitlePrincipal, config.titlePrincipalsFile)
+    val persons = readDataFile(sc, mapToPerson, config.nameBasicsFile)
 
     // get the average number of votes across all titles
     var (averageNumberOfVotes, total) = calculateAverage(ratings)
 
     // formula to calculate title ranks as per task
-    val rankFormula = (x: TitleRating) => x.averageRating * x.numVotes/averageNumberOfVotes
+    val rankFormula = (x: TitleRating) => x.averageRating * x.numVotes / averageNumberOfVotes
 
     // build map of tconst->rank
-    val topTitles : Map[String,Float] = takeTopTitles(ratings, 20, rankFormula)
-                                        .map(x => (x._1.tconst, x._2))
-                                        .toMap
+    val topTitles: Map[String, Float] = takeTopTitles(ratings, config.topTitles, rankFormula)
+      .map(x => (x._1.tconst, x._2))
+      .toMap
 
+
+    // find top title names
     val topTitleNames = findTopTitleNames(titleAkas, topTitles)
     topTitleNames.onComplete {
-      case Success(names) => names.foreach(x => println(s"Rank: ${x._1}, Name: ${x._2.get("GB").orElse(x._2.get("\\N")).getOrElse("")}, other names: ${x._2.values.mkString(", ")}"))
+      case Success(names) => names.foreach(x => println(s"Rank: ${x._1}, Name: \"${x._2.get("GB").orElse(x._2.get("\\N")).getOrElse("")}\", other names: ${x._2.values.mkString(", ")}"))
       case Failure(e) => println(s"Failed to find top title names, exception = $e")
     }
 
+    // find top title principals
     val topPrincipals = findTopPrincipals(titlePrincipals, persons, topTitles.keySet)
     topPrincipals.onComplete {
       case Success(principals) => principals.foreach(x => println(s"${x._1} was in ${x._2} top titles"))
@@ -58,6 +104,7 @@ object App {
 
   /**
     * Find additional names to top titles sorted by title rank
+    *
     * @param titleAkas
     * @param topTitles
     * @return
