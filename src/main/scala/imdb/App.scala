@@ -2,7 +2,7 @@ package imdb
 
 import imdb.Parsers._
 import org.apache.spark.rdd.RDD
-import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.{FutureAction, SparkConf, SparkContext}
 
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext.Implicits.global
@@ -10,47 +10,11 @@ import scala.concurrent.duration._
 import scala.reflect.ClassTag
 import scala.util.{Failure, Success}
 
-case class Config( minVotes: Int = 50,
-                   topTitles: Int = 20,
-                   sparkMaster: String = "local[*]",
-                   timeout: Duration = 1 hour,
-                   titleRatingsFile: String = "title.ratings.tsv.gz",
-                   titleAkasFile: String = "title.akas.tsv.gz",
-                   titlePrincipalsFile: String = "title.principals.tsv.gz",
-                   nameBasicsFile: String = "name.basics.tsv.gz",
-                   )
+
 object App {
-  private val parser = new scopt.OptionParser[Config]("imdb") {
-    head("imdb", "1.x")
-
-    opt[Int]('m', "minVotes") action { (x, c) =>
-      c.copy(minVotes = x) } text("Minimum number of votes for a title (default: 50)")
-
-    opt[Int]('t', "topTitles") action { (x, c) =>
-      c.copy(topTitles = x) } text("Number of top titles to selec (default: 20)")
-
-    opt[String]("sparkMaster") action { (x, c) =>
-      c.copy(sparkMaster = x) } text("Spark Master host (default: local[*])")
-
-    opt[String]("timeout") action { (x, c) =>
-      c.copy(timeout = Duration.apply(x)) } text("Spark job timeout (default 1 hour)")
-
-    opt[String]("titleRatingsFile") required() valueName("<file>") action { (x, c) =>
-      c.copy(titleRatingsFile = x) } text("File containing the ratings information for titles (title.ratings.tsv.gz)")
-
-    opt[String]("titleAkasFile") required() valueName("<file>") action { (x, c) =>
-      c.copy(titleAkasFile = x) } text("File containing the title names (title.akas.tsv.gz)")
-
-    opt[String]("titlePrincipalsFile") required() valueName("<file>") action { (x, c) =>
-      c.copy(titlePrincipalsFile = x) } text("File containing title principals (title.principals.tsv.gz)")
-
-    opt[String]("nameBasicsFile") required() valueName("<file>") action { (x, c) =>
-      c.copy(nameBasicsFile = x) } text("File containing information for names (name.basics.tsv.gz )")
-
-  }
 
   def main(args : Array[String]) {
-    parser.parse(args, Config()) map { config =>
+    Config.parser.parse(args, Config()) map { config =>
       doRun(config)
     } getOrElse {
       println("Invalid command line arguments")
@@ -87,7 +51,7 @@ object App {
     // find top title names
     val topTitleNames = findTopTitleNames(titleAkas, topTitles)
     topTitleNames.onComplete {
-      case Success(names) => names.foreach(x => println(s"Rank: ${x._1}, Name: \"${x._2.get("GB").orElse(x._2.get("\\N")).getOrElse("")}\", other names: ${x._2.values.mkString(", ")}"))
+      case Success(names) => names.foreach(x => println(s"Rank: ${x._1}, Name: ${x._2.get("GB").orElse(x._2.get("\\N")).getOrElse("")}, other names: " + x._2.values.mkString(", ")))
       case Failure(e) => println(s"Failed to find top title names, exception = $e")
     }
 
@@ -105,11 +69,9 @@ object App {
   /**
     * Find additional names to top titles sorted by title rank
     *
-    * @param titleAkas
-    * @param topTitles
-    * @return
+    * @return FutureAction[ Seq[(rank, Map[region, titleName])] ]
     */
-  def findTopTitleNames(titleAkas: RDD[TitleAka], topTitles: Map[String,Float]) = {
+  def findTopTitleNames(titleAkas: RDD[TitleAka], topTitles: Map[String,Float]): FutureAction[Seq[(Float, Map[String, String])]] = {
     // filter title names using map of top titles
     titleAkas.filter(x => topTitles.contains(x.tconst))
       .groupBy(_.tconst) // group to get all names by tconst, then transform to tuple : (rank, Map[region, titleName])
@@ -120,12 +82,10 @@ object App {
 
   /**
     * Find all principals participating in given titles ranked by number of titles they appear
-    * @param titlePrincipals
-    * @param persons
-    * @param titles
-    * @return FutureAction[Seq[principal name, number of titles]]
-    * */
-  def findTopPrincipals(titlePrincipals: RDD[TitlePrincipal], persons: RDD[Person], titles: Set[String]) = {
+    *
+    * @return FutureAction[ Seq[principal name, number of titles] ]
+    */
+  def findTopPrincipals(titlePrincipals: RDD[TitlePrincipal], persons: RDD[Person], titles: Set[String]): FutureAction[Seq[(String, Long)]] = {
     // find all principal persons for top titles
     val principals = titlePrincipals.filter(x => titles.contains(x.tconst))
       .map(_.nconst) // build a map nconst to number of times it appears in top titles
@@ -135,13 +95,13 @@ object App {
     persons.filter(x => principals.contains(x.nconst))
       .map(x => (x, principals.get(x.nconst)))
       .sortBy(_._2, ascending = false) // sort and print out persons names
-      .map(x => (x._1.primaryName, x._2.getOrElse(0)))
+      .map(x => (x._1.primaryName, x._2.getOrElse(0L)))
       .collectAsync()
   }
 
   /**
     * Calculate average of numVotes across TitleRating dataset
-    * @param ratings
+    *
     * @return (average, total)
     */
   def calculateAverage(ratings: RDD[TitleRating]): (Float, Int) = {
@@ -150,12 +110,20 @@ object App {
                         ((a._1 * a._2) / (a._2 + b._2) + (b._1 * b._2) / (a._2 + b._2), a._2 + b._2))
   }
 
+  /**
+    * Find top titles based on ranking formula
+    *
+    * @return Seq[(title, rank)]
+    */
   def takeTopTitles(ratings: RDD[TitleRating], num:Int, rankFormula: TitleRating => Float): Seq[(TitleRating, Float)] = {
     ratings.map((x: TitleRating) => (x, rankFormula(x)))
-           .sortBy(_._2, ascending = false).cache()
+           .sortBy(_._2, ascending = false)
            .take(num)
   }
 
+  /**
+    * Read data file into RDD
+    */
   def readDataFile[T:ClassTag](sc: SparkContext, parser: String => T, filePath:String): RDD[T] = {
     var ratingsData = sc.textFile(filePath)
     // Extract the first row which is the header
